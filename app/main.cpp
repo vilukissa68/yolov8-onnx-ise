@@ -13,7 +13,7 @@ auto main(int argc, char *argv[]) -> int {
         GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
     // Path to your model
-    const char *model_path = "models/yolon.onnx";
+    const char *model_path = "../models/yolov8n.onnx";
 
     Ort::Session session(env, model_path, session_options);
 
