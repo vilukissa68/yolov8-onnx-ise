@@ -52,5 +52,5 @@ make
 ```
 
 # Visualize model graph
-[Netron](https:netron.app) can be used to visualize the computation graph.
+[Netron](https://netron.app) can be used to visualize the computation graph.
 
