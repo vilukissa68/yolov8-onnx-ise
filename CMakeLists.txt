@@ -35,6 +35,8 @@ ExternalProject_Add(opencv_proj
         ${OPENCV_INSTALL_DIR}/lib64/libopencv_core${LIB_EXT}
         ${OPENCV_INSTALL_DIR}/lib64/libopencv_imgproc${LIB_EXT}
         ${OPENCV_INSTALL_DIR}/lib64/libopencv_imgcodecs${LIB_EXT}
+        ${OPENCV_INSTALL_DIR}/lib64/libopencv_dnn${LIB_EXT}
+        #${OPENCV_INSTALL_DIR}/lib64/libopencv_highgui${LIB_EXT}
 )
 
 # Set OpenCV library paths
@@ -42,6 +44,8 @@ set(OpenCV_INCLUDE_DIRS ${OPENCV_INSTALL_DIR}/include/opencv4)
 set(OPENCV_CORE_LIB ${OPENCV_INSTALL_DIR}/lib64/libopencv_core${LIB_EXT})
 set(OPENCV_IMGPROC_LIB ${OPENCV_INSTALL_DIR}/lib64/libopencv_imgproc${LIB_EXT})
 set(OPENCV_IMGCODECS_LIB ${OPENCV_INSTALL_DIR}/lib64/libopencv_imgcodecs${LIB_EXT})
+set(OPENCV_DNN_LIB ${OPENCV_INSTALL_DIR}/lib64/libopencv_dnn${LIB_EXT})
+#set(OPENCV_HIGHGUI_LIB ${OPENCV_INSTALL_DIR}/lib64/libopencv_highgui${LIB_EXT})
 
 # Copy OpenCV .so to deploy dir
 ExternalProject_Add_Step(opencv_proj copy_libs
@@ -49,6 +53,8 @@ ExternalProject_Add_Step(opencv_proj copy_libs
     COMMAND ${CMAKE_COMMAND} -E copy ${OPENCV_CORE_LIB} ${DEPLOY_DIR}/
     COMMAND ${CMAKE_COMMAND} -E copy ${OPENCV_IMGPROC_LIB} ${DEPLOY_DIR}/
     COMMAND ${CMAKE_COMMAND} -E copy ${OPENCV_IMGCODECS_LIB} ${DEPLOY_DIR}/
+    COMMAND ${CMAKE_COMMAND} -E copy ${OPENCV_DNN_LIB} ${DEPLOY_DIR}/
+    #COMMAND ${CMAKE_COMMAND} -E copy ${OPENCV_HIGHGUI_LIB} ${DEPLOY_DIR}/
     COMMENT "Copy OpenCV shared libraries to deploy folder"
 )
 
@@ -104,6 +110,8 @@ target_link_libraries(my_app PRIVATE
     ${OPENCV_CORE_LIB}
     ${OPENCV_IMGPROC_LIB}
     ${OPENCV_IMGCODECS_LIB}
+    ${OPENCV_DNN_LIB}
+    #${OPENCV_HIGHGUI_LIB}
 )
 
 # Set RPATH so the runtime linker finds the .so files in deploy dir

@@ -1,86 +1,120 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
 #include <iostream>
-#include <onnxruntime_cxx_api.h>
-#include <opencv2/opencv.hpp>
+#include <iomanip>
+#include "inference.h"
+#include <filesystem>
+#include <fstream>
+#include <random>
 
-auto main(int argc, char *argv[]) -> int {
-    // Load the model and create InferenceSession
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ONNXRuntimeDemo");
+constexpr auto image_path = "../images/test.jpg";
 
-    Ort::SessionOptions session_options;
-    session_options.SetIntraOpNumThreads(1);
+void Detector(YOLO_V8*& p) {
+    std::filesystem::path current_path = std::filesystem::current_path();
+	cv::Mat img = cv::imread(image_path);
+	std::vector<DL_RESULT> res;
+	p->RunSession(img, res);
 
-    // Optional: enable optimization
-    session_options.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+	for (auto& re : res)
+	{
+		cv::RNG rng(cv::getTickCount());
+		cv::Scalar color(rng.uniform(0, 256), rng.uniform(0, 256), rng.uniform(0, 256));
 
-    // Path to your model
-    const char *model_path = "../models/yolov8n.onnx";
+		cv::rectangle(img, re.box, color, 3);
 
-    // Ort::Session session(env, model_path, session_options);
-    Ort::Session session = Ort::Session(env, model_path, session_options);
+		float confidence = floor(100 * re.confidence) / 100;
+		std::cout << std::fixed << std::setprecision(2);
+		std::string label = p->classes[re.classId] + " " +
+			std::to_string(confidence).substr(0, std::to_string(confidence).size() - 4);
 
-    std::cout << "Model loaded successfully!" << std::endl;
-    // Load model to onnx
-    // Load image from disk
-    // Run inference
-    // Get output
-    // Compute bounding boxes
-    // Write image with bounding boxes
+		cv::rectangle(
+			img,
+			cv::Point(re.box.x, re.box.y - 25),
+			cv::Point(re.box.x + label.length() * 15, re.box.y),
+			color,
+			cv::FILLED
+		);
 
-    // 1. Load image with OpenCV
-    cv::Mat img = cv::imread("../images/test.jpg");
-    if (img.empty()) {
-        std::cerr << "Failed to load image\n";
-        return -1;
+		cv::putText(
+			img,
+			label,
+			cv::Point(re.box.x, re.box.y - 5),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.75,
+			cv::Scalar(0, 0, 0),
+			2
+		);
+	}
+	cv::imwrite("result.jpg", img);
+}
+
+
+int ReadCocoYaml(YOLO_V8*& p) {
+    // Open the YAML file
+    std::ifstream file("coco.yaml");
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open file" << std::endl;
+        return 1;
     }
 
-    // 2. Resize to model’s expected size (e.g. 640x640 for YOLOv8)
-    int target_w = 640;
-    int target_h = 640;
-    cv::Mat resized;
-    cv::resize(img, resized, cv::Size(target_w, target_h));
+    // Read the file line by line
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(file, line))
+    {
+        lines.push_back(line);
+    }
 
-    // 3. Convert to float32 and normalize to [0,1]
-    resized.convertTo(resized, CV_32F, 1.0 / 255.0);
-
-    // 4. Convert HWC (OpenCV) → CHW (NCHW expected by ONNX)
-    std::vector<float> input_tensor_values(target_w * target_h * 3);
-    size_t index = 0;
-    for (int c = 0; c < 3; ++c) {
-        for (int y = 0; y < resized.rows; ++y) {
-            for (int x = 0; x < resized.cols; ++x) {
-                input_tensor_values[index++] = resized.at<cv::Vec3f>(y, x)[c];
-            }
+    // Find the start and end of the names section
+    std::size_t start = 0;
+    std::size_t end = 0;
+    for (std::size_t i = 0; i < lines.size(); i++)
+    {
+        if (lines[i].find("names:") != std::string::npos)
+        {
+            start = i + 1;
+        }
+        else if (start > 0 && lines[i].find(':') == std::string::npos)
+        {
+            end = i;
+            break;
         }
     }
 
-    // 5. Create input tensor
-    auto memory_info =
-        Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    std::vector<int64_t> input_shape = {1, 3, target_h, target_w};
-    size_t input_tensor_size = input_tensor_values.size();
-
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        memory_info, input_tensor_values.data(), input_tensor_size,
-        input_shape.data(), input_shape.size());
-
-    // 6. Run inference
-    const char *input_names[] = {"images"};   // check your model input name
-    const char *output_names[] = {"output0"}; // check your model output name
-
-    auto output_tensors = session.Run(Ort::RunOptions{nullptr}, input_names,
-                                      &input_tensor, 1, output_names, 1);
-
-    std::cout << "Inference done, got " << output_tensors.size()
-              << " output tensors\n";
-
-    // Output tensor values
-    float *output_data = output_tensors[0].GetTensorMutableData<float>();
-    size_t output_size =
-        output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
-    std::cout << "Output tensor size: " << output_size << std::endl;
-    for (size_t i = 0; i < std::min(output_size, size_t(10)); ++i) {
-        std::cout << output_data[i] << " ";
+    // Extract the names
+    std::vector<std::string> names;
+    for (std::size_t i = start; i < end; i++)
+    {
+        std::stringstream ss(lines[i]);
+        std::string name;
+        std::getline(ss, name, ':'); // Extract the number before the delimiter
+        std::getline(ss, name); // Extract the string after the delimiter
+        names.push_back(name);
     }
+
+    p->classes = names;
     return 0;
+}
+
+
+void DetectTest()
+{
+    YOLO_V8* yoloDetector = new YOLO_V8;
+    ReadCocoYaml(yoloDetector);
+    DL_INIT_PARAM params;
+    params.rectConfidenceThreshold = 0.1;
+    params.iouThreshold = 0.5;
+    params.modelPath = "../models/yolov8n.onnx";
+    params.imgSize = { 640, 640 };
+    params.modelType = YOLO_DETECT_V8;
+    params.cudaEnable = false;
+    yoloDetector->CreateSession(params);
+    Detector(yoloDetector);
+}
+
+
+int main()
+{
+	DetectTest();
 }
