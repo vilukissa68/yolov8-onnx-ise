@@ -1,2 +1,6 @@
 onnx
 ultralytics
+pycocotools
+torch
+tqdm
+torchvision
