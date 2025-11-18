@@ -12,6 +12,8 @@ from PIL import Image
 from tqdm import tqdm
 from torchvision import transforms
 import torch
+import numpy as np
+import cv2
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -27,6 +29,8 @@ COCO_DATASET_PATH = "datasets/coco/"
 IMG_HEIGHT = 640
 IMG_WIDTH = 640
 
+CONFIDENCE_THRESHOLD = 0.001
+IOU_THRESHOLD = 0.5
 
 coco = COCO("datasets/coco/annotations/instances_val2017.json")
 cat_ids = coco.getCatIds()
@@ -39,37 +43,47 @@ for i, name in model.names.items():  # YOLO index → class name
     coco_id = coco.getCatIds(catNms=[name])[0]
     yolo_to_coco[i] = coco_id
 
+
 # helper to invert padding/scale -> original coords
-def unpad_and_unscale_box(x1, y1, x2, y2, image_id, target_size=640, coco=coco):
-    # get original image size from COCO
-    img_info = coco.loadImgs(int(image_id))[0]
-    orig_w, orig_h = img_info["width"], img_info["height"]
+# def unpad_and_unscale_box(x1, y1, x2, y2, pad_x, pad_y, scale):
+#     new_w = x2 - x1
+#     new_h = y2 - y1
 
-    scale = target_size / max(orig_w, orig_h)
-    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-    pad_x = (target_size - new_w) // 2
-    pad_y = (target_size - new_h) // 2
+#     orig_w = (IMG_WIDTH - 2 * pad_x) / scale
+#     orig_h = (IMG_HEIGHT - 2 * pad_y) / scale
 
-    # remove padding, then undo scale
-    x1_un = (x1 - pad_x) / scale
-    y1_un = (y1 - pad_y) / scale
-    x2_un = (x2 - pad_x) / scale
-    y2_un = (y2 - pad_y) / scale
+#     # remove padding, then undo scale
+#     x1_un = (x1 - pad_x) / scale
+#     y1_un = (y1 - pad_y) / scale
+#     x2_un = (x2 - pad_x) / scale
+#     y2_un = (y2 - pad_y) / scale
 
-    # clip to image bounds
-    x1_un = max(0.0, min(x1_un, orig_w))
-    y1_un = max(0.0, min(y1_un, orig_h))
-    x2_un = max(0.0, min(x2_un, orig_w))
-    y2_un = max(0.0, min(y2_un, orig_h))
+#     # clip to image bounds
+#     x1_un = max(0.0, min(x1_un, orig_w))
+#     y1_un = max(0.0, min(y1_un, orig_h))
+#     x2_un = max(0.0, min(x2_un, orig_w))
+#     y2_un = max(0.0, min(y2_un, orig_h))
 
-    w = x2_un - x1_un
-    h = y2_un - y1_un
-    # sometimes tiny negative due to rounding; clamp
-    w = max(0.0, w)
-    h = max(0.0, h)
+#     w = x2_un - x1_un
+#     h = y2_un - y1_un
 
-    return [float(x1_un), float(y1_un), float(w), float(h)]
-                                                                 
+#     # sometimes tiny negative due to rounding; clamp
+#     w = max(0.0, w)
+#     h = max(0.0, h)
+
+
+#     return [float(x1_un), float(y1_un), float(w), float(h)]
+
+
+def unpad_and_unscale_box(x1, y1, x2, y2, pad_x, pad_y, scale, orig_w, orig_h):
+    x1 = (x1 - pad_x) / scale
+    y1 = (y1 - pad_y) / scale
+    x2 = (x2 - pad_x) / scale
+    y2 = (y2 - pad_y) / scale
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(orig_w, x2), min(orig_h, y2)
+    return [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+
 
 class COCODataset(Dataset):
     def __init__(self, root_dir, annotation_file, target_size=640):
@@ -81,27 +95,44 @@ class COCODataset(Dataset):
     def __len__(self):
         return len(self.image_ids)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, resize_with_padding=True):
         image_id = self.image_ids[idx]
         img_info = self.coco.loadImgs(image_id)[0]
         image_path = os.path.join(self.root_dir, img_info["file_name"])
         image = Image.open(image_path).convert("RGB")
+        # to BGR
         orig_w, orig_h = image.size
 
         # --- Resize with padding ---
-        scale = self.target_size / max(orig_w, orig_h)
-        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-        resized_image = image.resize((new_w, new_h), Image.BILINEAR)
+        if resize_with_padding:
+            scale = self.target_size / max(orig_w, orig_h)
+            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+            resized_image = image.resize((new_w, new_h), Image.BILINEAR)
 
-        # Paste on black canvas
-        canvas = Image.new("RGB", (self.target_size, self.target_size), (0, 0, 0))
-        pad_x = (self.target_size - new_w) // 2
-        pad_y = (self.target_size - new_h) // 2
-        canvas.paste(resized_image, (pad_x, pad_y))
+            # Paste on black canvas
+            canvas = Image.new(
+                "RGB", (self.target_size, self.target_size), (114, 114, 114)
+            )
+            pad_x = (self.target_size - new_w) // 2
+            pad_y = (self.target_size - new_h) // 2
+            canvas.paste(resized_image, (pad_x, pad_y))
 
-        # To tensor
-        transform = transforms.ToTensor()
-        image_tensor = transform(canvas)
+            # To tensor
+            transform = transforms.ToTensor()
+            image_tensor = transform(canvas)
+
+        # Only resize, no padding
+        else:
+            pad_x = 0
+            pad_y = 0
+            scale = self.target_size / max(orig_w, orig_h)
+            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+            print(
+                f"Resizing image {image_id} from ({orig_w}, {orig_h}) to ({new_w}, {new_h})"
+            )
+            image = image.resize((640, 640), Image.BILINEAR)
+            transform = transforms.ToTensor()
+            image_tensor = transform(image)
 
         # --- Load annotations ---
         ann_ids = self.coco.getAnnIds(imgIds=image_id)
@@ -128,6 +159,10 @@ class COCODataset(Dataset):
             "boxes": boxes,
             "labels": labels,
             "image_id": torch.tensor(image_id, dtype=torch.int64),
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "scale": scale,
+            "orig_size": torch.tensor([orig_h, orig_w]),
         }
 
         return image_tensor, target
@@ -241,7 +276,7 @@ def run_coco(args):
             # show_image(imgs[0].permute(1, 2, 0).numpy())
             imgs = imgs.to(args.device)
 
-            preds = model(imgs, conf=0.25)
+            preds = model(imgs, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD)
 
             for b in range(len(imgs)):
                 boxes = preds[b].boxes.xyxy.cpu().numpy()  # shape (num_boxes, 4)
@@ -251,20 +286,25 @@ def run_coco(args):
                 predictions_for_image = []
                 for box, label, score in zip(boxes, labels, scores):
                     x1, y1, x2, y2 = box
-                    image_id_int = targets[b]["image_id"].item() 
-                    xywh_orig = unpad_and_unscale_box(x1, y1, x2, y2, image_id_int, target_size=IMG_WIDTH, coco=coco)
+
+                    # Scale boxes back to original image size
+                    pad_x = targets[b]["pad_x"]
+                    pad_y = targets[b]["pad_y"]
+                    scale = targets[b]["scale"]
+                    orig_h, orig_w = targets[b]["orig_size"]
+                    xywh_orig = unpad_and_unscale_box(
+                        x1, y1, x2, y2, pad_x, pad_y, scale, orig_w, orig_h
+                    )
+
                     prediction = {
                         "image_id": targets[b]["image_id"].item(),
-                        "category_id": yolo_to_coco[int(label)],
+                        "category_id": yolo_to_coco[
+                            int(label)
+                        ],  # Map YOLO class to COCO category ID
                         "bbox": xywh_orig,
-                        "score": float(score),                   
+                        "score": float(score),
                     }
-                    print(
-                        f"Prediction class: {yolo_to_coco[int(label)]}, score: {score}, bbox: {box}"
-                    )
-                    print(
-                        f" Ground truth class: {targets[b]['labels']}, boxes: {targets[b]['boxes']}"
-                    )
+
                     predictions_for_image.append(prediction)
                 results.extend(predictions_for_image)
 
@@ -362,7 +402,7 @@ if __name__ == "__main__":
         dataset_val,
         batch_size=args.batch,
         shuffle=False,
-        num_workers=4,
+        num_workers=1,
         collate_fn=collate_fn,
     )
     # run_inference_with_profiling(model, dataloader_val, args.device)
@@ -370,10 +410,11 @@ if __name__ == "__main__":
     imgs, targets = next(iter(dataloader_val))
     preds = model(imgs)
 
-    # Show ground truth
-    gt_boxes = targets[0]["boxes"]
-    show_image_with_boxes(imgs[0], gt_boxes, title="Ground Truth")
+    for i in range(len(preds)):
+        # Show ground truth
+        gt_boxes = targets[i]["boxes"]
+        show_image_with_boxes(imgs[i], gt_boxes, title="Ground Truth")
 
-    # Show predictions
-    pred_boxes = preds[0].boxes.xyxy.cpu().numpy() if preds[0].boxes else []
-    show_image_with_boxes(imgs[0], pred_boxes, title="Predictions")
+        # Show predictions
+        pred_boxes = preds[i].boxes.xyxy.cpu().numpy() if preds[0].boxes else []
+        show_image_with_boxes(imgs[i], pred_boxes, title="Predictions")
