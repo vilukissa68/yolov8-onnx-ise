@@ -10,18 +10,37 @@ PROJECT_ROOT = FILE_ROOT.parent
 CURRENT_DIR = Path.cwd()
 
 
-def export_onnx(model, output_dir, image_size=(480, 640)):
-    model.export(format="onnx", imgsz=image_size, opset=13, dynamic=True, simplify=True)
+def export_onnx(model, output_dir, image_size=(640, 640)):
+    print(f"Exporting model to ONNX with image size {image_size}...")
 
-    # Ensure the output directory exists
-    os.makedirs(output_dir, exist_ok=True)
+    # The ultralytics export function saves the model in the current directory
+    # It returns the path to the exported model, but we'll build it ourselves
+    # to be certain.
+    model.export(
+        format="onnx",
+        imgsz=image_size,
+        opset=17,
+        dynamic=False,  # Export with static input dimensions
+        simplify=True,  # Runs onnx-simplifier, which includes constant folding
+    )
 
-    # Move all .onnx files to models
-    for file in os.listdir(CURRENT_DIR):
-        if file.endswith(".onnx"):
-            os.replace(CURRENT_DIR / file, PROJECT_ROOT / output_dir / file)
+    # --- Move the generated file to the desired output directory ---
+    # Construct the expected source path (in the current directory)
+    model_name_pt = Path(model.ckpt_path).name
+    onnx_file_name = model_name_pt.replace(".pt", ".onnx")
+    src_path = CURRENT_DIR / onnx_file_name
 
-    print(f"Model exported to {PROJECT_ROOT / output_dir}")
+    # Construct the destination path
+    dest_dir = PROJECT_ROOT / output_dir
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = dest_dir / onnx_file_name
+
+    # Move the file, overwriting if it exists
+    if src_path.exists():
+        os.replace(src_path, dest_path)
+        print(f"Model successfully exported and moved to {dest_path}")
+    else:
+        print(f"ERROR: Exported ONNX file not found at expected path: {src_path}")
 
 
 def get_yolo_pt(model_name="yolov8n.pt", image_size=(480, 640)):
@@ -52,7 +71,7 @@ def parse_args():
         "--image-size",
         type=int,
         nargs=2,
-        default=[480, 640],
+        default=[640, 640],
         help="Image size for the model",
     )
     parser.add_argument(

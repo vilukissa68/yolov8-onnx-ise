@@ -3,36 +3,61 @@
 import argparse
 import torch
 from ultralytics import YOLO
-from torchao.quantization import Int4WeightOnlyConfig, quantize_
+import copy
+import os
+
+from torch.utils.data import DataLoader
+from run_coco import COCODataset, collate_fn, COCO_DATASET_PATH
+
+from torchao.quantization.pt2e.quantize_pt2e import (
+    prepare_pt2e,
+    convert_pt2e,
+)
+
+from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+    get_symmetric_quantization_config,
+    XNNPACKQuantizer,
+)
+
+dataset_val = COCODataset(
+    root_dir=os.path.join(COCO_DATASET_PATH, "val2017"),
+    annotation_file=os.path.join(
+        COCO_DATASET_PATH, "annotations", "instances_val2017.json"
+    ),
+)
+dataloader_val = DataLoader(
+    dataset_val,
+    batch_size=16,
+    shuffle=False,
+    num_workers=1,
+    collate_fn=collate_fn,
+)
 
 
-def quantize_weight_only_int4(yolo_model):
-    core_model = yolo_model.model  # access underlying nn.Module
-    quantize_(
-        core_model,
-        Int4WeightOnlyConfig(
-            group_size=32,
-            version=1,
-            int4_packing_format="tile_packed_to_4d",
-            int4_choose_qparams_algorithm="hqq",
-        ),
-    )
-    print("Weight-only INT4 quantization completed.")
-    for name, param in core_model.named_parameters():
-        print(f"Parameter: {name}, Values: {param.flatten()[:10]}")
-    return core_model
+def calibrate(model, data_loader):
+    model.eval()
+    with torch.no_grad():
+        for image, target in data_loader:
+            model(image)
 
 
 def quantize_yolo_model(model_path, method):
-    yolo_model = YOLO(model_path)
+    model = YOLO(model_path)
+    example_inputs = (torch.randn(1, 3, 640, 640),)
+    model = torch.export.export(model.model, example_inputs).module()
 
-    if method == "weight_only_int4":
-        core_model_q = quantize_weight_only_int4(yolo_model.model)
-    else:
-        raise ValueError(f"Unsupported quantization method: {method}")
+    quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config())
+    model = prepare_pt2e(model, quantizer)
 
-    torch.save(core_model_q.state_dict(), f"quantized_{method}_yolo.pth")
-    print(f"Saved quantized model to quantized_{method}_yolo.pth")
+    # calibration omitted
+
+    q_model = convert_pt2e(model)
+    print(q_model)
+
+    # Save quantized model
+    quantized_model_path = f"quantized_{method}_{os.path.basename(model_path)}"
+    # torch.save(q_model.state_dict(), quantized_model_path)
+    torch.save(q_model.state_dict(), quantized_model_path)
 
 
 if __name__ == "__main__":
