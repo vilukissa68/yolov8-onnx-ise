@@ -2,6 +2,9 @@
 import os
 import argparse
 
+import json
+import onnxruntime as ort
+from coco_utils import postprocess, yolo_to_coco
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from ultralytics import YOLO
@@ -31,48 +34,6 @@ IMG_WIDTH = 640
 
 CONFIDENCE_THRESHOLD = 0.001
 IOU_THRESHOLD = 0.5
-
-coco = COCO("datasets/coco/annotations/instances_val2017.json")
-cat_ids = coco.getCatIds()
-cat_ids_sorted = sorted(cat_ids)  # YOLO uses this order internally
-
-model = YOLO("yolov8n.pt")  # Load a YOLO model to get class names
-
-yolo_to_coco = {}
-for i, name in model.names.items():  # YOLO index → class name
-    coco_id = coco.getCatIds(catNms=[name])[0]
-    yolo_to_coco[i] = coco_id
-
-
-# helper to invert padding/scale -> original coords
-# def unpad_and_unscale_box(x1, y1, x2, y2, pad_x, pad_y, scale):
-#     new_w = x2 - x1
-#     new_h = y2 - y1
-
-#     orig_w = (IMG_WIDTH - 2 * pad_x) / scale
-#     orig_h = (IMG_HEIGHT - 2 * pad_y) / scale
-
-#     # remove padding, then undo scale
-#     x1_un = (x1 - pad_x) / scale
-#     y1_un = (y1 - pad_y) / scale
-#     x2_un = (x2 - pad_x) / scale
-#     y2_un = (y2 - pad_y) / scale
-
-#     # clip to image bounds
-#     x1_un = max(0.0, min(x1_un, orig_w))
-#     y1_un = max(0.0, min(y1_un, orig_h))
-#     x2_un = max(0.0, min(x2_un, orig_w))
-#     y2_un = max(0.0, min(y2_un, orig_h))
-
-#     w = x2_un - x1_un
-#     h = y2_un - y1_un
-
-#     # sometimes tiny negative due to rounding; clamp
-#     w = max(0.0, w)
-#     h = max(0.0, h)
-
-
-#     return [float(x1_un), float(y1_un), float(w), float(h)]
 
 
 def unpad_and_unscale_box(x1, y1, x2, y2, pad_x, pad_y, scale, orig_w, orig_h):
@@ -249,9 +210,122 @@ def collate_fn(batch):
     return images, targets
 
 
+def run_coco_onnx(args):
+    print(f"Loading ONNX model: {args.onnx_model}")
+
+    available_providers = ort.get_available_providers()
+    providers = []
+    if args.device == "cuda" and "CUDAExecutionProvider" in available_providers:
+        print("Using CUDAExecutionProvider for ONNX Runtime.")
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        if args.device == "cuda":
+            print("CUDAExecutionProvider not available. Falling back to CPU.")
+        print("Using CPUExecutionProvider for ONNX Runtime.")
+        providers = ["CPUExecutionProvider"]
+
+    session = ort.InferenceSession(args.onnx_model, providers=providers)
+    input_name = session.get_inputs()[0].name
+
+    dataset_val = COCODataset(
+        root_dir=os.path.join(COCO_DATASET_PATH, "val2017"),
+        annotation_file=os.path.join(
+            COCO_DATASET_PATH, "annotations", "instances_val2017.json"
+        ),
+    )
+    dataloader_val = DataLoader(
+        dataset_val,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=collate_fn,
+    )
+
+    results = []
+    with torch.no_grad():
+        for imgs, targets in tqdm(
+            dataloader_val, desc="Running ONNX model on Validation Set"
+        ):
+            preds = session.run(["output0"], {input_name: imgs.numpy()})[0]
+            print(preds)
+            processed_preds = postprocess(preds, CONFIDENCE_THRESHOLD, IOU_THRESHOLD)
+
+            if args.visualize:
+                print("Visualizing predictions for the first image...")
+                # Get the first image from the batch and its detections
+                img_tensor_to_show = imgs[0]
+                detections_to_show = processed_preds[0]
+
+                # Extract xyxy boxes only if detections exist
+                if detections_to_show.shape[0] > 0:
+                    boxes_to_show = detections_to_show[:, :4]
+                else:
+                    print("No detections found for this image.")
+                    boxes_to_show = []  # Show image with no boxes
+
+                show_image_with_boxes(
+                    img_tensor_to_show,
+                    boxes_to_show,
+                    title="ONNX Model Predictions",
+                )
+                # Exit after showing the image
+                return
+
+            for b in range(len(processed_preds)):
+                detections = processed_preds[b]
+                if detections.shape[0] == 0:
+                    continue
+
+                boxes = detections[:, :4]  # xyxy
+                scores = detections[:, 4]
+                class_ids = detections[:, 5]
+
+                for box, score, class_id in zip(boxes, scores, class_ids):
+                    x1, y1, x2, y2 = box
+
+                    # Scale boxes back to original image size
+                    pad_x = targets[b]["pad_x"]
+                    pad_y = targets[b]["pad_y"]
+                    scale = targets[b]["scale"]
+                    orig_h, orig_w = targets[b]["orig_size"]
+                    xywh_orig = unpad_and_unscale_box(
+                        x1, y1, x2, y2, pad_x, pad_y, scale, orig_w, orig_h
+                    )
+
+                    prediction = {
+                        "image_id": targets[b]["image_id"].item(),
+                        "category_id": yolo_to_coco[int(class_id)],
+                        "bbox": xywh_orig,
+                        "score": float(score),
+                    }
+                    results.append(prediction)
+
+    results_file = "results_coco_onnx.json"
+    with open(results_file, "w") as f:
+        json.dump(results, f)
+
+    # Check if any results were generated. If not, pycocotools will crash.
+    if not results:
+        print("\nWARNING: No detections were made across the dataset.")
+        print("Skipping COCO evaluation. The model may be performing poorly.")
+        return
+
+    # Run COCO evaluation
+    print("Running COCO evaluation...")
+    coco_gt = dataset_val.coco
+    coco_dt = coco_gt.loadRes(results_file)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+
+
 def run_coco(args):
     print(f"Loading YOLO model: {args.model}")
-    model = YOLO(args.model)
+    model = YOLO("yolov8n.pt")
+    state_dict = torch.load("quantized_weight_only_int4_yolov8n.pt")
+    model.model.load_state_dict(state_dict)
+    print(model)
     model.to(args.device)
 
     dataset_val = COCODataset(
@@ -364,6 +438,9 @@ if __name__ == "__main__":
         help="Path to the YOLO model file (e.g., yolov8n.pt)",
     )
     parser.add_argument(
+        "--onnx_model", type=str, default=None, help="Path to ONNX model"
+    )
+    parser.add_argument(
         "--data",
         type=str,
         default="coco.yaml",
@@ -378,8 +455,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="0",
+        default="cuda",
         help="Device to run the model on (e.g., '0' or 'cpu')",
+    )
+
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Show bounding box predictions on the first image of the first batch and exit.",
     )
 
     args = parser.parse_args()
@@ -387,7 +470,11 @@ if __name__ == "__main__":
     # Download COCO validation data if not present
     get_coco_data(train=False, test=False, unlabeled=False)
 
-    # Run COCO benchmark
+    if args.onnx_model:
+        run_coco_onnx(args)
+        exit()
+
+    # Run COCO benchmark for PyTorch model
     run_coco(args)
 
     # Run inference with profiling
