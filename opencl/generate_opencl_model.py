@@ -4,7 +4,6 @@ import onnx
 import numpy as np
 import tvm
 from tvm import relay
-from tvm.micro import export_model_library_format
 from ultralytics import YOLO
 import argparse
 from tvm.contrib import cc
@@ -162,7 +161,7 @@ def generate_opencl_library(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compile YOLOv8 to C-Source using TVM")
+    parser = argparse.ArgumentParser(description="Compile YOLOv8 to OpenCL using TVM")
 
     parser.add_argument(
         "--model",
