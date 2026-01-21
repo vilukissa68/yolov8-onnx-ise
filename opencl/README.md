@@ -68,6 +68,17 @@ export LD_LIBRARY_PATH=yolov8-onnx-ise/3rdparty/opencv/build/lib:$LD_LIBRARY_PAT
 ```
 
 ## Linux
+
+### CMake Build
+``` sh
+mkdir build
+cd build
+cmake ..
+make -j$(nproc)
+```
+
+
+### Manual Build
 ``` sh
 g++ run_yolov8_coco.cpp \
     -std=c++17 \

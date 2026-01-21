@@ -181,6 +181,13 @@ int main(int argc, char **argv) {
 
     // Load TVM model
     std::cout << "Loading module: " << lib_path << std::endl;
+
+    // Enforce that lib_path starts with "./" or "/"
+    if (lib_path.substr(0, 2) != "./" && lib_path[0] != '/') {
+	    std::cout << "Invalid lib_path, prepending ./" << std::endl;
+	    lib_path = "./" + lib_path;
+	}
+
     Module mod = Module::LoadFromFile(lib_path);
 
     DLDevice dev = {kDLOpenCL, 0};
