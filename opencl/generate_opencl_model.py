@@ -113,6 +113,7 @@ def generate_opencl_library(
     model_path,
     output_dir="tvm_opencl_out",
     quantize=False,
+    target_arch="native",
 ):
     input_shape = (1, 3, 640, 640)
     input_name = "images"
@@ -128,8 +129,16 @@ def generate_opencl_library(
     if quantize:
         mod, params = quantize_model(mod, params, input_shape)
 
-    # Setup OpenCL target
-    target = tvm.target.Target("opencl")
+
+    # Setup target architecture
+    if target_arch == "riscv64":
+        target = tvm.target.Target("opencl", host="llvm -mtriple=riscv64-unknown-linux-gnu -mcpu=generic-rv64 -mabi=lp64d -mattr=+64bit,+m,+a,+f,+d,+c"     )
+        compiler = "riscv64-unknown-linux-gnu-gcc"
+    else:
+        target = tvm.target.Target("opencl")
+        compiler = cc.create_shared
+
+
     dev = tvm.opencl(0)
 
     print("[INFO] Compiling for OpenCL GPU...")
@@ -140,10 +149,11 @@ def generate_opencl_library(
             params=params,
         )
 
+
     # Export shared library with the model
     os.makedirs(output_dir, exist_ok=True)
     so_path = os.path.join(output_dir, "yolov8_opencl.so")
-    lib.export_library(so_path, cc.create_shared)
+    lib.export_library(so_path, cc=compiler)
 
     print("\n[SUCCESS] OpenCL compilation complete!")
     print(f"• Shared library: {so_path}")
@@ -186,8 +196,15 @@ if __name__ == "__main__":
         help="Enable Int8 Quantization. (Warning: Reduces accuracy significantly without real calibration data)",
     )
 
+    parser.add_argument("--target-arch",
+                        type=str,
+                        default="native",
+                        choices=["native", "riscv64"], 
+                        help="Target architecture for the generated .so (native or riscv64)"
+    )
+
     args = parser.parse_args()
 
     onnx_file = export_yolo_to_onnx(args.model)
 
-    generate_opencl_library(onnx_file, output_dir=args.output, quantize=args.quantize)
+    generate_opencl_library(onnx_file, output_dir=args.output, quantize=args.quantize, target_arch=args.target_arch)
