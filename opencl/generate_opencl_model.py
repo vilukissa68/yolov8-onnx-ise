@@ -130,16 +130,18 @@ def generate_opencl_library(
         mod, params = quantize_model(mod, params, input_shape)
 
 
+    max_threads_per_block = 1024
     # Setup target architecture
     if target_arch == "riscv64":
         target = tvm.target.Target("opencl", host="llvm -mtriple=riscv64-unknown-linux-gnu -mcpu=generic-rv64 -mabi=lp64d -mattr=+64bit,+m,+a,+f,+d,+c"     )
         compiler = "riscv64-unknown-linux-gnu-gcc"
     else:
-        target = tvm.target.Target("opencl")
+        target = tvm.target.Target(f"opencl -max_threads_per_block={max_threads_per_block} -max_num_threads={max_threads_per_block}")
         compiler = cc.create_shared
 
 
     dev = tvm.opencl(0)
+    print(dev)
 
     print("[INFO] Compiling for OpenCL GPU...")
     with tvm.transform.PassContext(opt_level=3):
@@ -153,20 +155,20 @@ def generate_opencl_library(
     # Export shared library with the model
     os.makedirs(output_dir, exist_ok=True)
     so_path = os.path.join(output_dir, "yolov8_opencl.so")
-    lib.export_library(so_path, cc=compiler)
+    lib.export_library(so_path, cc.create_shared)
 
     print("\n[SUCCESS] OpenCL compilation complete!")
     print(f"• Shared library: {so_path}")
 
-    # Try to export raw OpenCL kernels as .cl file
-    try:
-        cl_src = lib.get_lib().get_source("opencl")
+    import json
+    for m in lib.get_lib().imported_modules:
+        print(m.type_key)
+        #if m.type_key == "opencl":
+        source = m.get_source("asm")
         cl_path = os.path.join(output_dir, "kernels.cl")
         with open(cl_path, "w") as f:
-            f.write(cl_src)
-        print(f"• OpenCL kernels: {cl_path}")
-    except Exception:
-        print("[INFO] Kernels embedded (no raw .cl emitted)")
+            f.write(source)
+       
 
     return so_path
 

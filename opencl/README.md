@@ -1,17 +1,4 @@
-# Compile OpenCV
-Clone OpenCV and compile for platform as library.
-In project root:
-``` sh
-git submodule update --init --recursive
-cd 3rdparty/opencv
-mkdir build
-cd build
-cmake -DOPENCV_GENERATE_PKGCONFIG=ON ..
-make -j$(nproc)
-sudo make install
-```
-
-# Install TVM
+# Get Dependencies
 
 ## Install Python dependencies
 Setting up a virtual environment might be useful.
@@ -54,31 +41,55 @@ pip install -e .
 
 More detailed instructions: https://tvm.apache.org/docs/install/from_source.html
 
-# Generate C Model
+# CMake Build
+Using CMake is the preferred way to build the process
+``` sh
+mkdir build
+cd build
+cmake .. -DUSE_QUANTIZATION=ON
+make -j$(nproc)
+```
 
+# CMake Build (RISC-V)
+For RISC-V build we need to specify cross compilation parameters.
+``` sh
+mkdir build
+cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../../riscv_toolchain.cmake
+make -j$(nproc)
+```
+
+
+# Manual Build
+
+## Compile OpenCV
+Clone OpenCV and compile for platform as library.
+In project root:
+``` sh
+git submodule update --init --recursive
+cd 3rdparty/opencv
+mkdir build
+cd build
+cmake -DOPENCV_GENERATE_PKGCONFIG=ON ..
+make -j$(nproc)
+sudo make install
+```
+
+If CMake build fails the project can be built with g++
+
+## Generate C Model
 ``` sh
 python generate_c_model.py
 ```
 
-# Compile
+## Compile
 ``` sh
 export TVM_HOME=<path-to-tvm-root-dir>
 export LD_LIBRARY_PATH=$TVM_HOME/build:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=yolov8-onnx-ise/3rdparty/opencv/build/lib:$LD_LIBRARY_PATH
 ```
 
-## Linux
-
-### CMake Build
-``` sh
-mkdir build
-cd build
-cmake ..
-make -j$(nproc)
-```
-
-
-### Manual Build
+### Linux
 ``` sh
 g++ run_yolov8_coco.cpp \
     -std=c++17 \
@@ -92,7 +103,8 @@ g++ run_yolov8_coco.cpp \
     -o yolov8_app
 ```
 
-## Mac
+### Mac
+On linux we need to use clang++ to correctly invoke OpenCL and OpenCV dependencies
 ``` sh
 clang++ run_yolov8.cpp \
     -std=c++17 \
@@ -106,7 +118,7 @@ clang++ run_yolov8.cpp \
     -o yolov8_app
 ```
 
-# Run
+### Run
 OpenCL reads DYLD_LIBRARY_PATH for the compiled model library
 ``` sh
 export DYLD_LIBRARY_PATH=<this-folder>:$DYLD_LIBRARY_PATH
