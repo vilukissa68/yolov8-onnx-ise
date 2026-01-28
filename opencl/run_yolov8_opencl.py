@@ -2,144 +2,206 @@
 import os
 import argparse
 import numpy as np
-
-# 1. TVM Imports - Keep at the top
-import tvm
-from tvm import relax
-from tvm import runtime as rt
-import tvm.dlight as dl
-from tvm.relax.frontend.onnx import from_onnx
-
-# 2. Supporting imports
 import onnx
+import time
+import sys
+
+# 1. TVM Imports (RELAY ONLY)
+import tvm
+from tvm import relay
+from tvm.contrib import graph_executor
+
+# 2. Quantization Imports
+try:
+    from onnxruntime.quantization import (
+        quantize_static,
+        CalibrationDataReader,
+        QuantType,
+        QuantFormat,
+    )
+
+    HAS_ORT = True
+except ImportError:
+    HAS_ORT = False
+    print("[WARN] onnxruntime-quantization not found. Int8 calibration will fail.")
+
 from ultralytics import YOLO
 
-
-# Fix for numpy versions that deprecated np.math
+# Fix for numpy deprecation
 if not hasattr(np, "math"):
     import math
 
     np.math = math
 
 
-def export_yolo_to_onnx(model_path):
-    """Exports YOLOv8 model to ONNX format."""
-    base_name = os.path.splitext(os.path.basename(model_path))[0]
-    onnx_path = os.path.join(os.path.dirname(model_path), f"{base_name}.onnx")
-    print(f"[INFO] Exporting {model_path} to {onnx_path}...")
-    model = YOLO(model_path)
-    # Simplify and static shapes are highly recommended for TVM
-    model.export(format="onnx", simplify=True, dynamic=False)
-    return onnx_path
+# ==============================================================================
+# 1. Calibration Data Reader
+# ==============================================================================
+class YoloCalibrationDataReader(CalibrationDataReader):
+    def __init__(self, model_path, n_samples=20):
+        self.model_path = model_path
+        self.enum_data = None
+        self.n_samples = n_samples
+        self.input_name = "images"
+        self.input_shape = (1, 3, 640, 640)
+        self.cnt = 0
+
+    def get_next(self):
+        if self.cnt >= self.n_samples:
+            return None
+        self.cnt += 1
+        # Random data for calibration
+        data = np.random.uniform(0.0, 1.0, size=self.input_shape).astype("float32")
+        return {self.input_name: data}
 
 
-def run_yolo_relax(model_path, device_type="cuda", quantize=False):
-    input_shape = (1, 3, 640, 640)
-    input_name = "images"
-
-    # 1. Load ONNX model
-    onnx_model = onnx.load(model_path)
-    shape_dict = {input_name: input_shape}
-
-    print(f"[INFO] Importing ONNX into TVM Relax for {device_type}...")
-    mod = from_onnx(onnx_model, shape_dict)
-
-    if device_type == "cuda":
-        target = tvm.target.Target("cuda", host="llvm")
-        dev = tvm.cuda(0)
-    elif device_type == "opencl":
-        target = tvm.target.Target("opencl", host="llvm")
-        dev = tvm.opencl(0)
-    elif device_type == "cpu":
-        target = tvm.target.Target("llvm -mcpu=znver3")
-        dev = tvm.cpu(0)
-    else:
-        print("No such device")
-
-    print(f"[INFO] Applying Relax transformation passes...")
-
-    # DLight handles the scheduling (mapping loops to GPU threads)
-    # This prevents the 'Memory verification failed' error
-    seq = tvm.transform.Sequential(
-        [
-            relax.transform.DecomposeOpsForInference(),
-            relax.transform.LegalizeOps(),
-            dl.ApplyDefaultSchedule(dl.gpu.Fallback()),
-            relax.transform.FoldConstant(),
-        ]
-    )
-
-    with target:
-        mod = seq(mod)
-
-    if quantize:
-        print(
-            "[WARNING] Quantization is not yet implemented for Relax. Continuing without quantization."
+# ==============================================================================
+# 2. Quantization Logic (ONNX Runtime -> Q-ONNX)
+# ==============================================================================
+def perform_int8_quantization(onnx_path):
+    if not HAS_ORT:
+        raise ImportError(
+            "Install 'onnxruntime' and 'onnxruntime-quantization' for Int8."
         )
 
-    # 4. Build the Relax model
-    print(f"[INFO] Compiling for Target: {target}")
-    with tvm.transform.PassContext(opt_level=3):
-        ex = relax.build(mod, target=target)
+    q_model_path = onnx_path.replace(".onnx", "_int8.onnx")
 
-    # 5. Initialize Virtual Machine
-    print("[INFO] Initializing Relax Virtual Machine...")
-    vm = relax.VirtualMachine(ex, dev)
+    if os.path.exists(q_model_path):
+        print(f"[INFO] Found existing Int8 model: {q_model_path}")
+        return q_model_path
 
-    # 6. Prepare Input
-    data = np.random.uniform(0, 1, input_shape).astype("float32")
-    tvm_data = rt.tensor(data, dev)
+    print(f"[INFO] Calibrating and Quantizing {onnx_path}...")
+    dr = YoloCalibrationDataReader(onnx_path)
 
-    print("[INFO] Warming up...")
-    for _ in range(3):
-        _ = vm["main"](tvm_data)
+    # QDQ Format is critical for TVM Relay
+    quantize_static(
+        model_input=onnx_path,
+        model_output=q_model_path,
+        calibration_data_reader=dr,
+        quant_format=QuantFormat.QDQ,
+        per_channel=False,
+        weight_type=QuantType.QUInt8,
+        activation_type=QuantType.QUInt8,
+    )
+    print(f"[INFO] Int8 Model saved to: {q_model_path}")
+    return q_model_path
 
-    print("[INFO] Running benchmark...")
-    timer = vm.module.time_evaluator("main", dev, number=1, repeat=10)
-    prof_res = timer(tvm_data)
 
-    raw_output = vm["main"](tvm_data)
+# ==============================================================================
+# 3. TVM RELAY Compiler (Stable)
+# ==============================================================================
+def compile_model_relay(model_path, target_str, device, input_shape):
+    print(f"[INFO] Loading ONNX model: {model_path}")
+    onnx_model = onnx.load(model_path)
 
-    if isinstance(raw_output, (list, tuple)):
-        output_np = raw_output[0].numpy()
+    shape_dict = {"images": input_shape}
+
+    # Import into Relay
+    # Relay's frontend is mature and handles numpy.int64 types correctly
+    print(f"[INFO] Importing into TVM Relay...")
+    mod, params = relay.frontend.from_onnx(onnx_model, shape_dict)
+
+    # Define Target
+    if target_str == "opencl":
+        # -device=mali is a good default hint for mobile GPUs, typically harmless on others
+        target = tvm.target.Target("opencl", host="llvm")
+    elif target_str == "cuda":
+        target = tvm.target.Target("cuda", host="llvm")
+    elif target_str == "cpu":
+        # Optimized CPU instructions
+        target = tvm.target.Target("llvm")
     else:
-        output_np = raw_output.numpy()
+        raise ValueError(f"Unsupported target: {target_str}")
 
-    print(f"\n[SUCCESS] Inference finished!")
-    print(f"Device: {device_type}")
-    print(f"Mean Inference Time: {prof_res.mean * 1000:.4f} ms")
-    print(f"FPS: {1.0 / prof_res.mean:.2f}")
-    print(f"Output Shape: {output_np.shape}")
+    print(f"[INFO] Compiling for target: {target}")
+
+    # Build with optimization level 3
+    # This handles both FP32 and Int8 fusion automatically
+    with tvm.transform.PassContext(opt_level=3):
+        lib = relay.build(mod, target=target, params=params)
+
+    # Create the runtime module
+    m = graph_executor.GraphModule(lib["default"](device))
+    return m
+
+
+# ==============================================================================
+# 4. Main Runner
+# ==============================================================================
+def run_benchmark(args):
+    input_shape = (1, 3, 640, 640)
+
+    # 1. Device Setup
+    if args.target == "cuda":
+        dev = tvm.cuda(0)
+    elif args.target == "opencl":
+        dev = tvm.opencl(0)
+    elif args.target == "cpu":
+        dev = tvm.cpu(0)
+    else:
+        print(f"[ERROR] Unsupported target: {args.target}")
+        sys.exit(1)
+
+    # 2. Pipeline Selection
+    final_model_path = args.model
+
+    if args.quantize:
+        print("[INFO] Mode: INT8 Quantization")
+        # Generate or Load Q-ONNX
+        final_model_path = perform_int8_quantization(args.model)
+    else:
+        print("[INFO] Mode: FP32 (Standard)")
+
+    # 3. Compile (Using Relay for EVERYTHING)
+    executor = compile_model_relay(final_model_path, args.target, dev, input_shape)
+
+    # 4. Data Prep
+    data_np = np.random.uniform(0, 1, input_shape).astype("float32")
+    tvm_data = tvm.nd.array(data_np, dev)
+
+    # 5. Benchmark Loop
+    print(f"[INFO] Warming up...")
+    executor.set_input("images", tvm_data)
+    for _ in range(3):
+        executor.run()
+
+    print(f"[INFO] Benchmarking...")
+    # Sync before start if GPU
+    if args.target in ["cuda", "opencl"]:
+        dev.sync()
+
+    start = time.time()
+    for _ in range(50):
+        executor.run()
+        # Sync required for accurate GPU timing
+        if args.target in ["cuda", "opencl"]:
+            dev.sync()
+    end = time.time()
+
+    avg = (end - start) / 50.0
+
+    print(f"\n[SUCCESS] Finished!")
+    print(f"Model:   {final_model_path}")
+    print(f"Target:  {args.target}")
+    print(f"Avg:     {avg * 1000:.4f} ms")
+    print(f"FPS:     {1.0 / avg:.2f}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run YOLOv8 on GPU using TVM Relax")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="yolov8n.pt")
     parser.add_argument(
-        "--model", type=str, default="yolov8n.pt", help="Path to .pt or .onnx"
+        "--target", type=str, default="cuda", choices=["cuda", "opencl", "cpu"]
     )
-    parser.add_argument(
-        "--target",
-        type=str,
-        default="cuda",
-        choices=["cuda", "opencl", "cpu"],
-        help="Target device",
-    )
-    parser.add_argument(
-        "--quantize", action="store_true", help="Enable Mixed Precision/Quantization."
-    )
-
+    parser.add_argument("--quantize", action="store_true", help="Use Int8 Quantization")
     args = parser.parse_args()
 
+    # Auto-export .pt to .onnx
     if args.model.endswith(".pt"):
-        onnx_file = export_yolo_to_onnx(args.model)
-    else:
-        onnx_file = args.model
+        print(f"[INFO] Exporting {args.model} to ONNX...")
+        model = YOLO(args.model)
+        # opset=12 is historically more stable for Relay, but 13 works for most recent versions
+        model.export(format="onnx", simplify=True, dynamic=False, opset=12)
+        args.model = args.model.replace(".pt", ".onnx")
 
-    # 2. Run Inference
-    try:
-        run_yolo_relax(onnx_file, device_type=args.target, quantize=args.quantize)
-    except Exception as e:
-        print(f"\n[ERROR] Execution failed: {e}")
-        print("\nTip: If you see 'AttributeError: module tvm has no attribute nd',")
-        print("ensure your PYTHONPATH points to your 'tvm-upstream/python' folder")
-        print("and that you have uninstalled any pip versions of tvm.")
+    run_benchmark(args)
